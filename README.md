@@ -26,7 +26,7 @@ Requires Neovim 0.11+ and a Rust toolchain (the server is built on install).
 
 ```lua
 {
-  "MasterTemple/css-class-completion",
+  "MasterTemple/css-class-lsp",
   build = "cargo build --release",
   opts = {},
   config = function(_, opts) require("css-class-lsp").setup(opts) end,
@@ -35,7 +35,7 @@ Requires Neovim 0.11+ and a Rust toolchain (the server is built on install).
 
 ### Other plugin managers
 
-Install `MasterTemple/css-class-completion`, run `cargo build --release` in the
+Install `MasterTemple/css-class-lsp`, run `cargo build --release` in the
 plugin directory, and call `require("css-class-lsp").setup({})`.
 
 The plugin starts `target/release/css-class-lsp` from its own directory if it
@@ -43,7 +43,7 @@ exists, and otherwise `css-class-lsp` on `$PATH`. To install the server
 separately:
 
 ```sh
-cargo install --git https://github.com/MasterTemple/css-class-completion
+cargo install --git https://github.com/MasterTemple/css-class-lsp
 ```
 
 ### Telescope (optional)

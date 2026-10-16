@@ -6,6 +6,8 @@ next to the Tailwind CSS language server.
 
 - **Completion** inside class strings, with the source file in the menu and the
   CSS rule plus the reference count in the docs preview
+- **Selector completion in stylesheets**: typing `.` in a CSS selector suggests
+  classes your markup uses that no stylesheet defines yet, most used first
 - **Go to definition / declaration**: jumps to the selector in the stylesheet
 - **Find references**: every use in source files (and `@apply` in CSS)
 - **Hover**: definition location(s), reference count, and the CSS rule

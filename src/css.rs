@@ -282,6 +282,46 @@ pub fn snippet(text: &str, start: usize, end: usize, max_lines: usize) -> String
     out.join("\n").trim_end().to_string()
 }
 
+/// If the cursor is typing a class in a selector (`.fo|`), the offset right
+/// after the dot. Declarations (`padding: .5rem`) and at-rules don't count.
+pub fn selector_class_start(text: &str, offset: usize) -> Option<usize> {
+    let b = text.as_bytes();
+    let mut s = offset;
+    while s > 0 && (b[s - 1].is_ascii_alphanumeric() || matches!(b[s - 1], b'-' | b'_' | b'\\') || b[s - 1] >= 0x80) {
+        s -= 1;
+    }
+    if s == 0 || b[s - 1] != b'.' {
+        return None;
+    }
+    let seg_start = text[..s - 1].rfind(['{', '}', ';']).map_or(0, |i| i + 1);
+    let seg = text[seg_start..s - 1].trim_start();
+    // `.5rem`, `@media`, and `prop: value` (a pseudo-class has no space after `:`).
+    let is_decl = {
+        let name_len = seg.bytes().take_while(|c| c.is_ascii_alphabetic() || *c == b'-').count();
+        let rest = seg[name_len..].trim_start();
+        name_len > 0 && rest.starts_with(':') && rest[1..].starts_with(|c: char| c.is_whitespace())
+    };
+    let in_comment = text[..s].rfind("/*").is_some_and(|o| !text[o..s].contains("*/"));
+    let digit_next = s < offset && b[s].is_ascii_digit();
+    (!seg.starts_with('@') && !is_decl && !in_comment && !digit_next).then_some(s)
+}
+
+/// Escape a class name for use in a selector (`md:flex` -> `md\:flex`).
+pub fn escape_ident(name: &str) -> String {
+    let mut out = String::with_capacity(name.len());
+    for (i, c) in name.chars().enumerate() {
+        if c.is_ascii_alphanumeric() && !(i == 0 && c.is_ascii_digit()) || c == '-' || c == '_' || !c.is_ascii() {
+            out.push(c);
+        } else if c.is_ascii_digit() {
+            out.push_str(&format!("\\{:x} ", c as u32));
+        } else {
+            out.push('\\');
+            out.push(c);
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -322,6 +362,28 @@ mod tests {
     fn tailwind_utility() {
         let src = "@layer components { .btn { @apply px-4; } }\n@utility tab-4 { tab-size: 4; }";
         assert_eq!(names(src, false), ["btn", "tab-4"]);
+    }
+
+    #[test]
+    fn selector_context() {
+        let at = |src: &str| selector_class_start(src, src.len());
+        assert_eq!(at(".fo"), Some(1));
+        assert_eq!(at(".a { color: red; }\n.card-ti"), Some(20));
+        assert_eq!(at("a:hover .x"), Some(9));
+        assert_eq!(at(".a { &:hover .b"), Some(14));
+        assert_eq!(at(".a { padding: .5"), None);
+        assert_eq!(at(".a { margin: .x"), None);
+        assert_eq!(at("@media (min-width: .x"), None);
+        assert_eq!(at("/* .x"), None);
+        assert_eq!(at("fo"), None);
+        assert_eq!(at("x {} .5"), None);
+    }
+
+    #[test]
+    fn escapes() {
+        assert_eq!(escape_ident("md:flex"), "md\\:flex");
+        assert_eq!(escape_ident("w-[10px]"), "w-\\[10px\\]");
+        assert_eq!(escape_ident("2xl"), "\\32 xl");
     }
 
     #[test]

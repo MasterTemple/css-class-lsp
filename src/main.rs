@@ -497,6 +497,12 @@ impl Server {
         let Some(doc) = self.docs.get(tdp.text_document.uri.as_str()) else { return Ok(Value::Null) };
         let offset = doc.li.offset(&doc.text, tdp.position, self.enc);
         let is_css = self.cfg.css_ext.contains(&doc.path.extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase());
+        if is_css {
+            if let Some(start) = css::selector_class_start(&doc.text, offset) {
+                let range = Range::new(doc.li.position(&doc.text, start, self.enc), tdp.position);
+                return self.undefined_completion(range);
+            }
+        }
         let regions = if is_css {
             usage::regions_for(&self.cfg.apply, &doc.text)
         } else {
@@ -530,6 +536,54 @@ impl Server {
                     filter_text: Some(name.clone()),
                     text_edit: Some(CompletionTextEdit::Edit(TextEdit::new(range, name.clone()))),
                     data: Some(Value::String(name)),
+                    ..Default::default()
+                }
+            })
+            .collect();
+        Ok(serde_json::to_value(CompletionResponse::List(CompletionList { is_incomplete: false, items }))?)
+    }
+
+    /// In a stylesheet selector: classes used in source files that no
+    /// stylesheet defines yet, most used first.
+    fn undefined_completion(&mut self, range: Range) -> Result<Value> {
+        let mut used: HashMap<String, Vec<(PathBuf, u32)>> = HashMap::new();
+        for (path, fd) in self.index.files.iter().filter(|(_, f)| !f.is_css) {
+            for u in fd.usages.iter().filter(|u| u.certain) {
+                used.entry(u.name.clone()).or_default().push((path.clone(), u.span.line + 1));
+            }
+        }
+        let mut used: Vec<_> = used.into_iter().filter(|(name, _)| !self.index.is_known(name)).collect();
+        used.sort_by(|a, b| b.1.len().cmp(&a.1.len()).then_with(|| a.0.cmp(&b.0)));
+
+        let items: Vec<CompletionItem> = used
+            .into_iter()
+            .enumerate()
+            .map(|(rank, (name, mut locs))| {
+                locs.sort();
+                let n = locs.len();
+                let mut doc = format!("**`.{name}`** — used {n} time{}, not defined yet\n", if n == 1 { "" } else { "s" });
+                for (p, line) in locs.iter().take(MAX_HOVER_DEFS) {
+                    let _ = write!(doc, "\n- `{}:{line}`", self.rel(p));
+                }
+                if n > MAX_HOVER_DEFS {
+                    let _ = write!(doc, "\n- _…and {} more_", n - MAX_HOVER_DEFS);
+                }
+                let text = css::escape_ident(&name);
+                CompletionItem {
+                    label: name.clone(),
+                    label_details: Some(CompletionItemLabelDetails {
+                        detail: None,
+                        description: Some(format!("undefined · {n} use{}", if n == 1 { "" } else { "s" })),
+                    }),
+                    kind: Some(CompletionItemKind::CLASS),
+                    detail: Some(format!("used in {}", self.rel(&locs[0].0))),
+                    documentation: Some(Documentation::MarkupContent(MarkupContent {
+                        kind: MarkupKind::Markdown,
+                        value: doc,
+                    })),
+                    sort_text: Some(format!("{rank:06}")),
+                    filter_text: Some(text.clone()),
+                    text_edit: Some(CompletionTextEdit::Edit(TextEdit::new(range, text))),
                     ..Default::default()
                 }
             })

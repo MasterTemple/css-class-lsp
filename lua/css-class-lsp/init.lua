@@ -80,9 +80,11 @@ local function other_target_dirs(root)
 	return dirs
 end
 
+local bin = vim.fn.has("win32") == 1 and "css-class-lsp.exe" or "css-class-lsp"
+
 local function find_in(dirs, searched)
 	for _, dir in ipairs(dirs) do
-		for _, p in ipairs({ "/release/css-class-lsp", "/debug/css-class-lsp" }) do
+		for _, p in ipairs({ "/release/" .. bin, "/debug/" .. bin }) do
 			if vim.list_contains(searched, dir .. p) then
 				break
 			end

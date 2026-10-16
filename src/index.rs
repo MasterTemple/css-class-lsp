@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 
@@ -24,6 +24,8 @@ pub struct ClassDef {
 pub struct Usage {
     pub name: String,
     pub span: Span,
+    /// See [`usage::Token::certain`].
+    pub certain: bool,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -31,6 +33,9 @@ pub struct FileData {
     pub defs: Vec<ClassDef>,
     pub usages: Vec<Usage>,
     pub is_css: bool,
+    /// Build output (e.g. Tailwind's). Its classes only count as "known" for
+    /// diagnostics; they are hidden from completion, hover and definitions.
+    pub generated: bool,
 }
 
 #[derive(Default)]
@@ -44,6 +49,7 @@ pub struct Summary {
 pub struct Index {
     pub files: HashMap<PathBuf, FileData>,
     summary: Option<HashMap<String, Summary>>,
+    known: Option<HashSet<String>>,
 }
 
 impl Index {
@@ -52,18 +58,36 @@ impl Index {
             Some(d) => self.files.insert(path, d),
             None => self.files.remove(&path),
         };
-        self.summary = None;
+        self.invalidate();
     }
 
     pub fn replace_all(&mut self, files: HashMap<PathBuf, FileData>) {
         self.files = files;
+        self.invalidate();
+    }
+
+    fn invalidate(&mut self) {
         self.summary = None;
+        self.known = None;
+    }
+
+    /// Whether a class is defined anywhere, including generated stylesheets.
+    pub fn is_known(&mut self, name: &str) -> bool {
+        if self.summary().contains_key(name) {
+            return true;
+        }
+        let files = &self.files;
+        self.known
+            .get_or_insert_with(|| {
+                files.values().filter(|f| f.generated).flat_map(|f| f.defs.iter().map(|d| d.name.clone())).collect()
+            })
+            .contains(name)
     }
 
     pub fn summary(&mut self) -> &HashMap<String, Summary> {
         self.summary.get_or_insert_with(|| {
             let mut m: HashMap<String, Summary> = HashMap::new();
-            for (path, fd) in &self.files {
+            for (path, fd) in self.files.iter().filter(|(_, f)| !f.generated) {
                 for (i, d) in fd.defs.iter().enumerate() {
                     m.entry(d.name.clone()).or_default().defs.push((path.clone(), i));
                 }
@@ -126,18 +150,23 @@ pub fn analyze(path: &Path, text: &str, cfg: &Config) -> Option<FileData> {
     };
     let add_usages = |fd: &mut FileData, regions: Vec<(usize, usize)>| {
         for r in regions {
-            for (s, e) in usage::tokens(text, r) {
-                fd.usages.push(Usage { name: text[s..e].to_string(), span: Span::new(text, &li, s, e) });
+            for t in usage::tokens(text, r) {
+                fd.usages.push(Usage {
+                    name: text[t.start..t.end].to_string(),
+                    span: Span::new(text, &li, t.start, t.end),
+                    certain: t.certain,
+                });
             }
         }
     };
 
     if cfg.css_ext.contains(&ext) {
-        if cfg.skip_generated && is_generated(path, text) {
-            return None;
-        }
         fd.is_css = true;
         add_defs(&mut fd, 0, text.len(), matches!(ext.as_str(), "scss" | "less"));
+        if cfg.is_forced_generated(path) || (cfg.skip_generated && is_generated(path, text)) {
+            fd.generated = true;
+            return Some(fd);
+        }
         add_usages(&mut fd, usage::regions_for(&cfg.apply, text));
     } else if cfg.source_ext.contains(&ext) {
         add_usages(&mut fd, usage::class_regions(text, &cfg.patterns));
@@ -194,6 +223,9 @@ pub fn scan(roots: &[PathBuf], cfg: &Config) -> HashMap<PathBuf, FileData> {
                 paths.push(entry.into_path());
             }
         }
+    }
+    for root in roots {
+        paths.extend(cfg.output_paths(root).into_iter().filter(|p| p.is_file()));
     }
     paths.sort();
     paths.dedup();

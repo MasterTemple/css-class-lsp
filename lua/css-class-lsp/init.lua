@@ -42,6 +42,18 @@ M.defaults = {
 		skip_generated = true,
 		respect_gitignore = true,
 		max_file_size = 2 * 1024 * 1024,
+		-- Paths (relative to the root) of Tailwind build output. Classes in it
+		-- count as defined for diagnostics but stay out of completion/hover.
+		-- Common locations like assets/tailwind.css are detected automatically.
+		tailwind_output = {},
+		diagnostics = {
+			-- Report classes that aren't defined in any stylesheet.
+			enabled = true,
+			-- "error" | "warning" | "info" | "hint", or vim.diagnostic.severity.*
+			severity = "warning",
+			-- Regexes (Rust syntax); matching class names are never reported.
+			ignore = {},
+		},
 	},
 }
 
@@ -101,6 +113,83 @@ function M.info()
 	end
 end
 
+local qf_type = { "E", "W", "I", "N" }
+
+--- Collect every undefined class in the workspace as quickfix items and pass
+--- them to `on_done(items)`. Reports errors itself; `on_done` is not called
+--- when no client is running or the index isn't ready.
+function M.undefined_items(on_done)
+	local cs = clients()
+	if #cs == 0 then
+		vim.notify("css-class-lsp: no active client", vim.log.levels.WARN)
+		return
+	end
+	local items, pending, ready = {}, #cs, true
+	for _, c in ipairs(cs) do
+		c:request("cssClassLsp/undefinedClasses", vim.empty_dict(), function(err, res)
+			if err then
+				vim.notify("css-class-lsp: " .. vim.inspect(err), vim.log.levels.ERROR)
+			elseif res == vim.NIL or res == nil then
+				ready = false
+			else
+				for _, d in ipairs(res) do
+					table.insert(items, {
+						filename = d.filename,
+						lnum = d.lnum,
+						col = d.col,
+						end_lnum = d.lnum,
+						end_col = d.end_col,
+						type = qf_type[d.severity] or "W",
+						text = ("CSS class `%s` is not defined in any stylesheet"):format(d.name),
+						user_data = { class = d.name },
+					})
+				end
+			end
+			pending = pending - 1
+			if pending == 0 then
+				if not ready and #items == 0 then
+					vim.notify("css-class-lsp: still indexing, try again in a moment", vim.log.levels.WARN)
+					return
+				end
+				on_done(items)
+			end
+		end)
+	end
+end
+
+--- Put every undefined class in the workspace into the quickfix list.
+function M.quickfix()
+	M.undefined_items(function(items)
+		vim.fn.setqflist({}, " ", { title = "Undefined CSS classes", items = items })
+		if #items == 0 then
+			vim.notify("css-class-lsp: no undefined classes")
+		else
+			vim.cmd("botright copen")
+		end
+	end)
+end
+
+--- All defined classes as quickfix-style items (via workspace/symbol).
+function M.class_items(on_done)
+	local cs = clients()
+	if #cs == 0 then
+		vim.notify("css-class-lsp: no active client", vim.log.levels.WARN)
+		return
+	end
+	local items, pending = {}, #cs
+	for _, c in ipairs(cs) do
+		c:request("workspace/symbol", { query = "" }, function(err, res)
+			if not err and res then
+				vim.list_extend(items, vim.lsp.util.symbols_to_items(res, 0, c.offset_encoding))
+			end
+			pending = pending - 1
+			if pending == 0 then
+				on_done(items)
+			end
+		end)
+	end
+end
+
 function M.setup(opts)
 	opts = vim.tbl_deep_extend("force", M.defaults, opts or {})
 	local cmd = opts.cmd or find_cmd()
@@ -154,6 +243,11 @@ function M.setup(opts)
 
 	vim.api.nvim_create_user_command("CssClassReindex", M.reindex, { desc = "Re-scan CSS classes in the workspace" })
 	vim.api.nvim_create_user_command("CssClassInfo", M.info, { desc = "Show css-class-lsp index stats" })
+	vim.api.nvim_create_user_command(
+		"CssClassQuickfix",
+		M.quickfix,
+		{ desc = "Quickfix list of undefined CSS classes in the workspace" }
+	)
 
 	if opts.reindex_on_focus then
 		local last = 0

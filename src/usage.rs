@@ -47,23 +47,53 @@ pub fn is_separator(c: u8) -> bool {
     c.is_ascii_whitespace() || matches!(c, b'"' | b'\'' | b'`' | b'{' | b'}' | b'(' | b')' | b',' | b';')
 }
 
+/// A class-like token. `certain` is false when the token may not be a whole
+/// class name: it touches an interpolation (`text-{size}`) or sits unquoted
+/// inside an object/expression (`{ active: cond }`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Token {
+    pub start: usize,
+    pub end: usize,
+    pub certain: bool,
+}
+
 /// Class-like tokens inside a region. `{...}` groups without quotes inside
 /// (Rust format args like `"btn {extra}"`, `${expr}`) are skipped.
-pub fn tokens(text: &str, (start, end): (usize, usize)) -> Vec<(usize, usize)> {
+pub fn tokens(text: &str, (start, end): (usize, usize)) -> Vec<Token> {
     let b = text.as_bytes();
-    let mut out = Vec::new();
+    let mut out: Vec<Token> = Vec::new();
+    let mut depth = 0usize;
+    let mut quote: Option<u8> = None;
     let mut i = start;
     while i < end {
-        if b[i] == b'{' {
+        let c = b[i];
+        if c == b'{' {
             if let Some(close) = b[i..end].iter().position(|&c| c == b'}') {
                 let inner = &b[i + 1..i + close];
                 if !inner.iter().any(|&c| matches!(c, b'"' | b'\'' | b'`' | b'{')) {
+                    // Interpolation: whatever touches it is only part of a name.
+                    if let Some(last) = out.last_mut().filter(|t| t.end == i) {
+                        last.certain = false;
+                    }
+                    // Drop a fragment glued to the end of it (`{a}-x`).
                     i += close + 1;
+                    while i < end && !is_separator(b[i]) {
+                        i += 1;
+                    }
                     continue;
                 }
             }
+            depth += 1;
+        } else if c == b'}' {
+            depth = depth.saturating_sub(1);
+        } else if depth > 0 && matches!(c, b'"' | b'\'' | b'`') {
+            quote = match quote {
+                Some(q) if q == c => None,
+                None => Some(c),
+                q => q,
+            };
         }
-        if is_separator(b[i]) {
+        if is_separator(c) {
             i += 1;
             continue;
         }
@@ -78,7 +108,7 @@ pub fn tokens(text: &str, (start, end): (usize, usize)) -> Vec<(usize, usize)> {
         }
         let tok = &text[s..e];
         if !tok.is_empty() && tok != "!important" && tok.bytes().any(|c| c.is_ascii_alphabetic()) {
-            out.push((s, e));
+            out.push(Token { start: s, end: e, certain: depth == 0 || quote.is_some() });
         }
     }
     out
@@ -117,7 +147,7 @@ mod tests {
         let cfg = Config::from_value(None);
         let mut v = Vec::new();
         for r in class_regions(src, &cfg.patterns) {
-            v.extend(tokens(src, r).into_iter().map(|(s, e)| &src[s..e]));
+            v.extend(tokens(src, r).into_iter().map(|t| &src[t.start..t.end]));
         }
         v
     }
@@ -140,6 +170,18 @@ rsx! {
         let src = r#"<div class="a b"></div><X className={`c d`} /><p :class="{ 'e': x, f: y }"></p>
 const k = clsx("g", cond && 'h');"#;
         assert_eq!(found(src), ["a", "b", "c", "d", "e", "x", "f", "y", "g", "h"]);
+    }
+
+    #[test]
+    fn uncertain_tokens() {
+        let src = r#"div { class: "text-{size} {a}-x lead" } <p :class="{ 'e': x }"></p>"#;
+        let cfg = Config::from_value(None);
+        let toks: Vec<(&str, bool)> = class_regions(src, &cfg.patterns)
+            .into_iter()
+            .flat_map(|r| tokens(src, r))
+            .map(|t| (&src[t.start..t.end], t.certain))
+            .collect();
+        assert_eq!(toks, [("text-", false), ("lead", true), ("e", true), ("x", false)]);
     }
 
     #[test]

@@ -25,6 +25,7 @@ use line_index::{Encoding, LineIndex};
 const MAX_HOVER_DEFS: usize = 5;
 
 struct Doc {
+    uri: Uri,
     path: PathBuf,
     text: String,
     li: LineIndex,
@@ -32,6 +33,8 @@ struct Doc {
 
 enum Internal {
     Indexed(HashMap<PathBuf, FileData>, Duration),
+    /// A generated stylesheet (Tailwind output) was rewritten.
+    OutputChanged(PathBuf),
 }
 
 struct Server {
@@ -46,6 +49,8 @@ struct Server {
     rx: Receiver<Internal>,
     indexing: bool,
     reindex_pending: bool,
+    /// Diagnostics wait for the first full scan to avoid flagging everything.
+    indexed_once: bool,
 }
 
 fn main() -> Result<()> {
@@ -75,6 +80,7 @@ fn main() -> Result<()> {
         }),
         hover_provider: Some(HoverProviderCapability::Simple(true)),
         definition_provider: Some(OneOf::Left(true)),
+        declaration_provider: Some(DeclarationCapability::Simple(true)),
         references_provider: Some(OneOf::Left(true)),
         workspace_symbol_provider: Some(OneOf::Left(true)),
         ..Default::default()
@@ -121,6 +127,7 @@ fn main() -> Result<()> {
         rx,
         indexing: false,
         reindex_pending: false,
+        indexed_once: false,
     };
     for e in server.cfg.errors.clone() {
         server.show(MessageType::ERROR, format!("css-class-lsp: {e}"));
@@ -129,6 +136,7 @@ fn main() -> Result<()> {
         server.register_watchers();
     }
     server.start_index();
+    server.watch_outputs();
     server.run()?;
     drop(server);
     io.join()?;
@@ -165,10 +173,16 @@ impl Server {
                         Message::Response(_) => {}
                     }
                 }
-                recv(rx) -> msg => {
-                    if let Ok(Internal::Indexed(files, took)) = msg {
-                        self.on_indexed(files, took);
+                recv(rx) -> msg => match msg {
+                    Ok(Internal::Indexed(files, took)) => self.on_indexed(files, took),
+                    Ok(Internal::OutputChanged(path)) => {
+                        if !self.docs.values().any(|d| d.path == path) {
+                            let data = index::read_and_analyze(&path, &self.cfg);
+                            self.index.set(path, data);
+                            self.publish_all();
+                        }
                     }
+                    Err(_) => {}
                 }
             }
         }
@@ -223,6 +237,32 @@ impl Server {
         });
     }
 
+    /// Poll generated stylesheets so new Tailwind utilities stop being flagged
+    /// as soon as the build rewrites its output, with or without file watching.
+    fn watch_outputs(&self) {
+        let paths: Vec<PathBuf> = self.roots.iter().flat_map(|r| self.cfg.output_paths(r)).collect();
+        if paths.is_empty() {
+            return;
+        }
+        let tx = self.tx.clone();
+        std::thread::spawn(move || {
+            let mtime = |p: &Path| std::fs::metadata(p).and_then(|m| m.modified()).ok();
+            let mut last: Vec<_> = paths.iter().map(|p| mtime(p)).collect();
+            loop {
+                std::thread::sleep(Duration::from_millis(750));
+                for (p, prev) in paths.iter().zip(last.iter_mut()) {
+                    let now = mtime(p);
+                    if now != *prev {
+                        *prev = now;
+                        if tx.send(Internal::OutputChanged(p.clone())).is_err() {
+                            return;
+                        }
+                    }
+                }
+            }
+        });
+    }
+
     fn on_indexed(&mut self, files: HashMap<PathBuf, FileData>, took: Duration) {
         self.indexing = false;
         let (n_files, n_css) = (files.len(), files.values().filter(|f| f.is_css).count());
@@ -237,9 +277,82 @@ impl Server {
             "indexed {n_classes} classes from {n_css} stylesheets ({n_files} files) in {:.0?}",
             took
         ));
+        self.indexed_once = true;
+        self.publish_all();
         if std::mem::take(&mut self.reindex_pending) {
             self.start_index();
         }
+    }
+
+    /// Usages in `path` that are not defined in any stylesheet.
+    fn undefined_in(&mut self, path: &Path) -> Vec<index::Usage> {
+        let d = &self.cfg.diagnostics;
+        let Some(fd) = self.index.files.get(path).filter(|f| !f.is_css) else { return Vec::new() };
+        let candidates: Vec<index::Usage> = fd
+            .usages
+            .iter()
+            .filter(|u| u.certain && !d.ignore.iter().any(|r| r.is_match(&u.name)))
+            .cloned()
+            .collect();
+        candidates.into_iter().filter(|u| !self.index.is_known(&u.name)).collect()
+    }
+
+    fn diagnostics_for(&mut self, path: &Path) -> Vec<Diagnostic> {
+        if !self.cfg.diagnostics.enabled || !self.indexed_once {
+            return Vec::new();
+        }
+        let severity = self.cfg.diagnostics.severity;
+        self.undefined_in(path)
+            .into_iter()
+            .map(|u| Diagnostic {
+                range: u.span.range(self.enc),
+                severity: Some(severity),
+                code: Some(NumberOrString::String("undefined-class".into())),
+                source: Some("css-class-lsp".into()),
+                message: format!("CSS class `{}` is not defined in any stylesheet", u.name),
+                ..Default::default()
+            })
+            .collect()
+    }
+
+    fn publish(&self, uri: Uri, diagnostics: Vec<Diagnostic>) {
+        self.notify::<notification::PublishDiagnostics>(PublishDiagnosticsParams { uri, diagnostics, version: None });
+    }
+
+    /// Any index change can (un)define classes used in every open buffer.
+    fn publish_all(&mut self) {
+        if !self.cfg.diagnostics.enabled {
+            return;
+        }
+        let docs: Vec<(Uri, PathBuf)> = self.docs.values().map(|d| (d.uri.clone(), d.path.clone())).collect();
+        for (uri, path) in docs {
+            let diags = self.diagnostics_for(&path);
+            self.publish(uri, diags);
+        }
+    }
+
+    /// Every undefined class in the workspace, for the quickfix list.
+    fn undefined_classes(&mut self) -> Value {
+        if !self.indexed_once {
+            return Value::Null;
+        }
+        let mut paths: Vec<PathBuf> = self.index.files.iter().filter(|(_, f)| !f.is_css).map(|(p, _)| p.clone()).collect();
+        paths.sort();
+        let severity = self.cfg.diagnostics.severity;
+        let mut out = Vec::new();
+        for path in paths {
+            for u in self.undefined_in(&path) {
+                out.push(serde_json::json!({
+                    "filename": path,
+                    "lnum": u.span.line + 1,
+                    "col": u.span.start8 + 1,
+                    "end_col": u.span.end8 + 1,
+                    "name": u.name,
+                    "severity": severity,
+                }));
+            }
+        }
+        Value::Array(out)
     }
 
     fn update_doc(&mut self, uri: &Uri, text: String) {
@@ -247,7 +360,8 @@ impl Server {
         let data = index::analyze(&path, &text, &self.cfg);
         self.index.set(path.clone(), data);
         let li = LineIndex::new(&text);
-        self.docs.insert(uri.as_str().to_string(), Doc { path, text, li });
+        self.docs.insert(uri.as_str().to_string(), Doc { uri: uri.clone(), path, text, li });
+        self.publish_all();
     }
 
     fn on_notification(&mut self, n: Notification) -> Result<()> {
@@ -268,6 +382,8 @@ impl Server {
                     // Fall back to what is on disk (changes may have been discarded).
                     let data = self.should_index(&doc.path).then(|| index::read_and_analyze(&doc.path, &self.cfg)).flatten();
                     self.index.set(doc.path, data);
+                    self.publish(doc.uri, Vec::new());
+                    self.publish_all();
                 }
             }
             "workspace/didChangeWatchedFiles" => {
@@ -284,6 +400,7 @@ impl Server {
                     };
                     self.index.set(path, data);
                 }
+                self.publish_all();
             }
             _ => {}
         }
@@ -295,7 +412,7 @@ impl Server {
         if !self.cfg.is_relevant(path) || self.cfg.is_excluded(path, &self.roots) {
             return false;
         }
-        if self.index.files.contains_key(path) {
+        if self.index.files.contains_key(path) || self.roots.iter().any(|r| self.cfg.output_paths(r).iter().any(|o| o == path)) {
             return true;
         }
         let in_root = self.roots.iter().any(|r| path.starts_with(r));
@@ -310,7 +427,8 @@ impl Server {
             "textDocument/completion" => parse(req.params).and_then(|p| self.completion(p)),
             "completionItem/resolve" => parse(req.params).and_then(|p| self.resolve(p)),
             "textDocument/hover" => parse(req.params).and_then(|p| self.hover(p)),
-            "textDocument/definition" => parse(req.params).and_then(|p| self.definition(p)),
+            // A class has no separate declaration; both jump to the selector.
+            "textDocument/definition" | "textDocument/declaration" => parse(req.params).and_then(|p| self.definition(p)),
             "textDocument/references" => parse(req.params).and_then(|p| self.references(p)),
             "workspace/symbol" => parse(req.params).and_then(|p| self.symbols(p)),
             "cssClassLsp/reindex" => {
@@ -318,6 +436,7 @@ impl Server {
                 Ok(Value::Null)
             }
             "cssClassLsp/stats" => Ok(self.stats()),
+            "cssClassLsp/undefinedClasses" => Ok(self.undefined_classes()),
             m => {
                 let msg = format!("unhandled method {m}");
                 self.send(Response::new_err(id, ErrorCode::MethodNotFound as i32, msg));
@@ -494,7 +613,13 @@ impl Server {
     fn stats(&mut self) -> Value {
         let files = self.index.files.len();
         let stylesheets: Vec<String> = {
-            let mut v: Vec<_> = self.index.files.iter().filter(|(_, f)| f.is_css || !f.defs.is_empty()).map(|(p, _)| self.rel(p).into_owned()).collect();
+            let mut v: Vec<_> = self
+                .index
+                .files
+                .iter()
+                .filter(|(_, f)| f.is_css || !f.defs.is_empty())
+                .map(|(p, f)| format!("{}{}", self.rel(p), if f.generated { " (generated, known only)" } else { "" }))
+                .collect();
             v.sort();
             v
         };

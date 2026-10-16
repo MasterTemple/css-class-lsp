@@ -3,6 +3,7 @@ use std::path::Path;
 
 use globset::{Glob, GlobSet, GlobSetBuilder};
 use regex::Regex;
+use lsp_types::DiagnosticSeverity;
 use serde::Deserialize;
 
 /// Regexes that locate strings containing class names. Every capture group
@@ -30,6 +31,10 @@ const DEFAULT_SOURCE_EXT: &[&str] = &[
     "rs", "html", "htm", "jsx", "tsx", "js", "ts", "mjs", "vue", "svelte", "astro", "heex", "erb",
     "hbs", "njk", "twig", "php", "templ",
 ];
+/// Common Tailwind output locations. They are read even when gitignored, and
+/// treated as generated only if they carry Tailwind's banner.
+const TAILWIND_OUTPUT_CANDIDATES: &[&str] =
+    &["assets/tailwind.css", "public/tailwind.css", "static/tailwind.css", "assets/output.css"];
 const DEFAULT_EXCLUDE: &[&str] = &["**/node_modules/**", "**/target/**", "**/.git/**"];
 
 #[derive(Deserialize)]
@@ -50,6 +55,30 @@ struct RawConfig {
     max_file_size: Option<u64>,
     respect_gitignore: Option<bool>,
     skip_generated: Option<bool>,
+    diagnostics: RawDiagnostics,
+    tailwind_output: Vec<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum RawSeverity {
+    Name(String),
+    Number(i64),
+}
+
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct RawDiagnostics {
+    enabled: Option<bool>,
+    severity: Option<RawSeverity>,
+    ignore: Vec<String>,
+}
+
+pub struct Diagnostics {
+    pub enabled: bool,
+    pub severity: DiagnosticSeverity,
+    /// Class names matching any of these are never reported.
+    pub ignore: Vec<Regex>,
 }
 
 pub enum Pattern {
@@ -66,6 +95,9 @@ pub struct Config {
     pub max_file_size: u64,
     pub respect_gitignore: bool,
     pub skip_generated: bool,
+    pub diagnostics: Diagnostics,
+    /// Paths (relative to a root) of build output that is always treated as generated.
+    pub tailwind_output: Vec<String>,
     /// Problems found while reading the configuration, reported to the user.
     pub errors: Vec<String>,
 }
@@ -111,7 +143,29 @@ impl Config {
                 }
             }
         }
+        let mut ignore = Vec::new();
+        for src in &raw.diagnostics.ignore {
+            match Regex::new(src) {
+                Ok(r) => ignore.push(r),
+                Err(e) => regex_errors.push(format!("invalid diagnostics.ignore {src:?}: {e}")),
+            }
+        }
         errors.extend(regex_errors);
+        let severity = match &raw.diagnostics.severity {
+            None => DiagnosticSeverity::WARNING,
+            Some(RawSeverity::Number(n @ 1..=4)) => match n {
+                1 => DiagnosticSeverity::ERROR,
+                2 => DiagnosticSeverity::WARNING,
+                3 => DiagnosticSeverity::INFORMATION,
+                _ => DiagnosticSeverity::HINT,
+            },
+            Some(RawSeverity::Name(n)) if severity_from_name(n).is_some() => severity_from_name(n).unwrap(),
+            Some(_) => {
+                errors.push("diagnostics.severity must be error, warning, info or hint".into());
+                DiagnosticSeverity::WARNING
+            }
+        };
+        let diagnostics = Diagnostics { enabled: raw.diagnostics.enabled.unwrap_or(true), severity, ignore };
         if !raw.disable_default_patterns {
             patterns.extend(DEFAULT_PATTERNS.iter().map(|s| Pattern::Single(Regex::new(s).unwrap())));
             patterns.extend(DEFAULT_NESTED.iter().map(|(a, b)| {
@@ -138,6 +192,8 @@ impl Config {
             max_file_size: raw.max_file_size.unwrap_or(2 * 1024 * 1024),
             respect_gitignore: raw.respect_gitignore.unwrap_or(true),
             skip_generated: raw.skip_generated.unwrap_or(true),
+            diagnostics,
+            tailwind_output: raw.tailwind_output,
             errors,
         }
     }
@@ -160,9 +216,34 @@ impl Config {
             .unwrap_or(false)
     }
 
+    /// Whether the user named this file as build output.
+    pub fn is_forced_generated(&self, path: &Path) -> bool {
+        self.tailwind_output.iter().any(|o| path.ends_with(o.trim_start_matches("./")))
+    }
+
+    /// Generated-CSS files to read under `root` even if gitignored.
+    pub fn output_paths(&self, root: &Path) -> Vec<std::path::PathBuf> {
+        TAILWIND_OUTPUT_CANDIDATES
+            .iter()
+            .copied()
+            .chain(self.tailwind_output.iter().map(|s| s.trim_start_matches("./")))
+            .map(|p| root.join(p))
+            .collect()
+    }
+
     pub fn all_extensions(&self) -> Vec<String> {
         let mut v: Vec<_> = self.css_ext.iter().chain(&self.source_ext).cloned().collect();
         v.sort();
         v
     }
+}
+
+fn severity_from_name(name: &str) -> Option<DiagnosticSeverity> {
+    Some(match name.to_ascii_lowercase().as_str() {
+        "error" => DiagnosticSeverity::ERROR,
+        "warning" | "warn" => DiagnosticSeverity::WARNING,
+        "information" | "info" => DiagnosticSeverity::INFORMATION,
+        "hint" => DiagnosticSeverity::HINT,
+        _ => return None,
+    })
 }

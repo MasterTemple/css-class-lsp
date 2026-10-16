@@ -62,20 +62,75 @@ local function plugin_root()
 	return vim.fn.fnamemodify(src, ":p:h:h:h")
 end
 
+-- Where `cargo build` may have put the binary besides <plugin>/target:
+-- CARGO_TARGET_DIR or `build.target-dir` in a cargo config.
+local function other_target_dirs(root)
+	local dirs = {}
+	if vim.env.CARGO_TARGET_DIR then
+		table.insert(dirs, (vim.fn.fnamemodify(vim.env.CARGO_TARGET_DIR, ":p"):gsub("/$", "")))
+	end
+	if vim.fn.executable("cargo") == 1 then
+		local out = vim.system({ "cargo", "metadata", "--format-version", "1", "--no-deps", "--offline" }, { cwd = root })
+			:wait(5000)
+		local ok, meta = pcall(vim.json.decode, out.stdout or "")
+		if out.code == 0 and ok and type(meta) == "table" and meta.target_directory then
+			table.insert(dirs, meta.target_directory)
+		end
+	end
+	return dirs
+end
+
+local function find_in(dirs, searched)
+	for _, dir in ipairs(dirs) do
+		for _, p in ipairs({ "/release/css-class-lsp", "/debug/css-class-lsp" }) do
+			if vim.list_contains(searched, dir .. p) then
+				break
+			end
+			table.insert(searched, dir .. p)
+			if vim.uv.fs_stat(dir .. p) then
+				return { dir .. p }
+			end
+		end
+	end
+end
+
+--- Returns the server command, or nil and the paths that were searched.
 local function find_cmd()
 	local root = plugin_root()
-	for _, p in ipairs({ "/target/release/css-class-lsp", "/target/debug/css-class-lsp" }) do
-		if vim.uv.fs_stat(root .. p) then
-			return { root .. p }
-		end
+	local searched = {}
+	local cmd = find_in({ root .. "/target" }, searched)
+	if cmd then
+		return cmd
 	end
 	if vim.fn.executable("css-class-lsp") == 1 then
 		return { "css-class-lsp" }
 	end
+	return find_in(other_target_dirs(root), searched), searched
 end
 
 local function clients(bufnr)
 	return vim.lsp.get_clients({ name = M.name, bufnr = bufnr })
+end
+
+-- Why there's no client, for the "no active client" message.
+local setup_error, last_exit
+
+local function no_client()
+	local msg = "css-class-lsp: no active client"
+	if setup_error then
+		msg = msg .. "\n" .. setup_error
+	elseif last_exit then
+		msg = msg .. ("\nserver exited (code %d, signal %d); see :LspLog"):format(last_exit.code, last_exit.signal)
+	elseif not M.config then
+		msg = msg .. "\nsetup() was never called"
+	else
+		msg = msg
+			.. ("\nnot attached to this buffer (filetype %q); root markers: %s"):format(
+				vim.bo.filetype,
+				table.concat(M.config.root_markers, ", ")
+			)
+	end
+	vim.notify(msg, vim.log.levels.WARN)
 end
 
 function M.reindex()
@@ -87,7 +142,7 @@ end
 function M.info()
 	local cs = clients()
 	if #cs == 0 then
-		vim.notify("css-class-lsp: no active client", vim.log.levels.WARN)
+		no_client()
 		return
 	end
 	for _, c in ipairs(cs) do
@@ -121,7 +176,7 @@ local qf_type = { "E", "W", "I", "N" }
 function M.undefined_items(on_done)
 	local cs = clients()
 	if #cs == 0 then
-		vim.notify("css-class-lsp: no active client", vim.log.levels.WARN)
+		no_client()
 		return
 	end
 	local items, pending, ready = {}, #cs, true
@@ -173,7 +228,7 @@ end
 function M.class_items(on_done)
 	local cs = clients()
 	if #cs == 0 then
-		vim.notify("css-class-lsp: no active client", vim.log.levels.WARN)
+		no_client()
 		return
 	end
 	local items, pending = {}, #cs
@@ -192,15 +247,18 @@ end
 
 function M.setup(opts)
 	opts = vim.tbl_deep_extend("force", M.defaults, opts or {})
-	local cmd = opts.cmd or find_cmd()
+	M.config = opts
+	setup_error, last_exit = nil, nil
+	local cmd, searched = opts.cmd, nil
 	if not cmd then
-		vim.notify(
-			"css-class-lsp: server binary not found. Run `cargo build --release` in "
-				.. plugin_root()
-				.. " or put css-class-lsp on $PATH.",
-			vim.log.levels.WARN
-		)
-		return
+		cmd, searched = find_cmd()
+	end
+	if not cmd then
+		setup_error = "server binary not found. Run `cargo build --release` in "
+			.. plugin_root()
+			.. " or put css-class-lsp on $PATH. Searched:\n  "
+			.. table.concat(searched, "\n  ")
+		vim.notify("css-class-lsp: " .. setup_error, vim.log.levels.WARN)
 	end
 
 	local watch = opts.watch_files
@@ -216,9 +274,16 @@ function M.setup(opts)
 		capabilities = {
 			workspace = { didChangeWatchedFiles = { dynamicRegistration = watch and true or false } },
 		},
+		on_exit = function(code, signal)
+			if code ~= 0 or signal ~= 0 then
+				last_exit = { code = code, signal = signal }
+			end
+		end,
 	}
 
-	if vim.lsp.config and vim.lsp.enable then
+	if not cmd then
+		-- Keep the commands below so they can report why there's no client.
+	elseif vim.lsp.config and vim.lsp.enable then
 		vim.lsp.config(M.name, config)
 		vim.lsp.enable(M.name)
 	else
